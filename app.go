@@ -1,8 +1,8 @@
 package main
 
 import (
+	"encoding/json"
 	"math"
-	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -34,11 +34,12 @@ type stretch struct {
 	high          float64
 }
 
+// Selection is a source picked on the viewer; the server measures it.
 type Selection struct {
-	X, Y         float64 // where it was picked, image pixels
-	Visit, Band  int
-	Motion       *sky.Motion
-	Measurements []sky.Measurement
+	X, Y        float64 // where it was picked, image pixels
+	Visit, Band int
+	Motion      *sky.Motion
+	busy        bool // a measurement is on its way
 }
 
 type App struct {
@@ -46,7 +47,7 @@ type App struct {
 	queue []func()
 
 	emit func(kind string, payload any)
-	// api is the origin of the IRSA proxy; empty means simulated data only.
+	// api is the origin of the server, which does the science.
 	api string
 	// gen changes with every Open, so answers for an older field are dropped.
 	gen int
@@ -92,26 +93,17 @@ func (a *App) drain() {
 	}
 }
 
-type targetInfo struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Aliases []string `json:"aliases"`
-	RA      float64  `json:"ra"`
-	Dec     float64  `json:"dec"`
-	PMRA    float64  `json:"pmra"`
-	PMDec   float64  `json:"pmdec"`
-	Band    int      `json:"band"`
-	Mode    string   `json:"mode"`
-}
-
-func targets() []targetInfo {
-	now := sky.TimeToMJD(time.Now())
-	out := make([]targetInfo, len(sky.Targets))
-	for i, t := range sky.Targets {
-		ra, dec := t.Source.Position(now)
-		out[i] = targetInfo{t.ID, t.Name, t.Aliases, ra, dec, t.Source.PMRA, t.Source.PMDec, t.Band, t.Mode}
-	}
-	return out
+// announce tells the page the engine is ready, with the test objects at
+// today's position as the server lists them.
+func (a *App) announce() {
+	go func() {
+		body, err := a.get("/api/targets")
+		targets := json.RawMessage("[]")
+		if err == nil && json.Valid(body) {
+			targets = body
+		}
+		a.Post(func() { a.emit("ready", map[string]any{"targets": targets}) })
+	}()
 }
 
 type visitInfo struct {
@@ -128,37 +120,27 @@ type channelInfo struct {
 }
 
 type fieldInfo struct {
-	TargetID  string        `json:"target"`
-	Name      string        `json:"name"`
-	RA        float64       `json:"ra"`
-	Dec       float64       `json:"dec"`
-	FOV       float64       `json:"fov"`
-	N         int           `json:"npix"`
-	PixScale  float64       `json:"pixscale"`
-	Real      bool          `json:"real"`
-	FluxUnit  string        `json:"fluxUnit"`
-	Visits    []visitInfo   `json:"visits"`
-	Channels  []channelInfo `json:"channels"`
-	FrameSize int           `json:"frameSize"` // cutout side in pixels, for the download estimate
+	TargetID string        `json:"target"`
+	Name     string        `json:"name"`
+	RA       float64       `json:"ra"`
+	Dec      float64       `json:"dec"`
+	FOV      float64       `json:"fov"`
+	N        int           `json:"npix"`
+	PixScale float64       `json:"pixscale"`
+	Real     bool          `json:"real"`
+	FluxUnit string        `json:"fluxUnit"`
+	Visits   []visitInfo   `json:"visits"`
+	Channels []channelInfo `json:"channels"`
 }
 
 func (a *App) Open(req OpenRequest) {
 	a.gen++
 	// A fast mover's current position changes the 6-decimal center every few
-	// hours; rounding to 1.8" keeps the archive requests, and so the proxy
-	// cache and its warm-up entries, the same for weeks.
+	// hours; rounding to 1.8" keeps the requests, and so the server cache and
+	// its warm-up entries, the same for weeks.
 	req.RA = math.Round(req.RA*2000) / 2000
 	req.Dec = math.Round(req.Dec*2000) / 2000
-	fov := math.Max(4, math.Min(12, req.FOV))
-	if req.Real && a.api != "" {
-		a.openReal(req, fov)
-		return
-	}
-	f := sky.NewField(req.RA, req.Dec, fov, sky.TimeToMJD(time.Now()))
-	if f.Name == "" {
-		f.Name = req.Name
-	}
-	a.startField(f, req, fov)
+	a.openField(req, math.Max(4, math.Min(12, req.FOV)))
 }
 
 func (a *App) startField(f *sky.Field, req OpenRequest, fov float64) {
@@ -174,7 +156,6 @@ func (a *App) startField(f *sky.Field, req OpenRequest, fov float64) {
 	info := fieldInfo{
 		TargetID: f.TargetID, Name: f.Name, RA: req.RA, Dec: req.Dec, FOV: fov,
 		N: f.N, PixScale: sky.PixScale, Real: f.Real, FluxUnit: f.FluxUnit,
-		FrameSize: int(math.Ceil(cutoutSize(fov) * 3600 / sky.PixScale)),
 	}
 	for _, v := range f.Visits {
 		info.Visits = append(info.Visits, visitInfo{v.MJD, sky.MJDToTime(v.MJD).Format("2006-01-02"), v.Season, int(math.Round(v.SubBand))})
@@ -202,15 +183,12 @@ func (a *App) SetView(v ViewState) {
 }
 
 // loader brings frames in nearest-first around the playhead in the current
-// channel, so playback can start right away. Simulated frames arrive with a
-// made-up latency; real ones are downloaded a few at a time.
+// channel, a few at a time, so playback can start right away.
 type loader struct {
 	pending  []*sky.Frame
-	wait     float64
 	total    int
 	done     int
 	inflight int
-	rng      *rand.Rand
 	// Frames whose download failed for a passing reason, back in the queue
 	// after a delay; attempts counts the tries per frame.
 	retry    []retryItem
@@ -232,7 +210,7 @@ func (l *loader) reset(f *sky.Field) {
 	l.done, l.inflight = 0, 0
 	for c := range sky.NumChannels {
 		for _, fr := range f.Frames[c] {
-			if f.Real && !fr.Available {
+			if !fr.Available {
 				fr.Loaded = true
 				continue
 			}
@@ -240,8 +218,6 @@ func (l *loader) reset(f *sky.Field) {
 		}
 	}
 	l.total = len(l.pending)
-	l.wait = 0.15
-	l.rng = rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 1))
 }
 
 func (l *loader) next(v ViewState) *sky.Frame {
@@ -295,34 +271,19 @@ func (a *App) Update(dt float64) {
 	}
 
 	l := &a.loader
-	var ev loadedEvent
-	if a.field.Real {
-		now := time.Now()
-		kept := l.retry[:0]
-		for _, r := range l.retry {
-			if now.After(r.at) {
-				l.pending = append(l.pending, r.frame)
-			} else {
-				kept = append(kept, r)
-			}
-		}
-		l.retry = kept
-		for l.inflight < maxInflight && len(l.pending) > 0 {
-			l.inflight++
-			a.fetchCutout(l.next(a.view))
-		}
-	} else {
-		l.wait -= dt
-		start := time.Now()
-		for l.wait <= 0 && len(l.pending) > 0 && time.Since(start) < 8*time.Millisecond {
-			fr := l.next(a.view)
-			a.field.Load(fr)
-			a.frameLoaded(fr, &ev)
-			l.wait += 0.004 + 0.02*l.rng.Float64()
+	now := time.Now()
+	kept := l.retry[:0]
+	for _, r := range l.retry {
+		if now.After(r.at) {
+			l.pending = append(l.pending, r.frame)
+		} else {
+			kept = append(kept, r)
 		}
 	}
-	if len(ev.Items) > 0 {
-		a.emit("loaded", ev)
+	l.retry = kept
+	for l.inflight < maxInflight && len(l.pending) > 0 {
+		l.inflight++
+		a.fetchFrame(l.next(a.view))
 	}
 
 	if a.dirty {
@@ -333,8 +294,10 @@ func (a *App) Update(dt float64) {
 		}
 	}
 
+	// New frames or catalog entries change the measurement; ask again at most
+	// once a second, one request at a time.
 	a.selTimer -= dt
-	if a.sel != nil && a.selDirty && a.selTimer <= 0 {
+	if a.sel != nil && a.selDirty && !a.sel.busy && a.selTimer <= 0 {
 		a.measureSelection()
 	}
 }

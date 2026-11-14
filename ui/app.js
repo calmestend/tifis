@@ -46,7 +46,7 @@ const state = {
   step: 'season',
   embed: false,
   specLog: true,
-  // Real SPHEREx images through the proxy; false falls back to the simulation.
+  // Real SPHEREx images through the server; false shows the simulation.
   real: false,
   // Wavelength of each loaded frame, [channel][visit], for season stepping.
   lambda: [],
@@ -356,7 +356,7 @@ async function resolveName(q) {
 
 // ---------- Archive ----------
 
-// The proxy that relays IRSA serves the app, so /api answering means real data.
+// The server that relays IRSA serves the app, so /api answering means real data.
 async function detectArchive() {
   if (new URLSearchParams(location.search).get('data') === 'sim') return false;
   try {
@@ -375,16 +375,16 @@ function renderBanner() {
 }
 
 let archiveTimer;
-let gaiaTimer;
 function renderArchiveStatus() {
   const v = state.status.visits;
   const box = $('archive-status');
   clearInterval(archiveTimer);
-  box.hidden = !v || v.state === 'done' || !state.real;
+  // A simulated field comes back at once; only its errors are worth showing.
+  box.hidden = !v || v.state === 'done' || (!state.real && v.state !== 'error');
   if (!box.hidden) {
     const loading = v.state === 'loading';
     $('archive-spinner').hidden = !loading;
-    $('archive-sim').hidden = loading;
+    $('archive-sim').hidden = loading || !state.real;
     $('archive-text').textContent = t(`archive.${v.state}`);
     const detail = () => {
       $('archive-detail').textContent = loading
@@ -395,31 +395,11 @@ function renderArchiveStatus() {
     if (loading) archiveTimer = setInterval(detail, 1000);
   }
   const c = state.status.catalog;
-  clearInterval(gaiaTimer);
-  const text = !state.real || !c ? ''
+  $('catalog-status').textContent = !state.real || !c ? ''
     : c.state === 'loading' ? t('catalog.loading')
     : c.state === 'error' ? t('catalog.error', { e: c.error })
     : c.missing?.length ? t('catalog.partial', { n: c.count, c: c.missing.join(', ') })
     : t('catalog.done', { n: c.count });
-  $('catalog-status').textContent = text;
-  // Gaia comes from 230 MB bulk files the first time a region is seen;
-  // show how far the download has got.
-  if (state.real && c?.state === 'loading') {
-    const poll = async () => {
-      try {
-        const r = state.request;
-        const files = await (await fetch(`/api/gaia/progress?ra=${r.ra}&dec=${r.dec}`)).json();
-        if (state.status.catalog?.state !== 'loading') return;
-        $('catalog-status').textContent = files.length
-          ? t('catalog.gaia', { p: Math.round(100 * Math.max(...files.map((f) => f.fraction))), mb: Math.round(files[0].mb) })
-          : text;
-      } catch {
-        // The plain message stays.
-      }
-    };
-    poll();
-    gaiaTimer = setInterval(poll, 2000);
-  }
 }
 
 // ---------- URL ----------
@@ -665,11 +645,9 @@ function renderFovCost() {
   const frames = state.field
     ? state.field.channels.reduce((n, c) => n + c.available.filter(Boolean).length, 0)
     : 360;
-  // Cutouts arrive in detector orientation, so they span the field's diagonal.
-  // Each has IMAGE, VARIANCE and ZODI (float32) and FLAGS (int32) plus about
-  // 72 KB of headers; the proxy leaves out the PSF cube.
-  const side = Math.ceil(px * Math.SQRT2 * 1.02);
-  const mb = (frames * (side * side * 16 + 72000)) / 1e6;
+  // The server sends each frame already on the field grid: image (float32)
+  // and flags (uint32) plus a 40-byte header.
+  const mb = (frames * (px * px * 8 + 40)) / 1e6;
   $('fov-cost').textContent = t('fov.cost', { n: frames, px, mb: mb < 10 ? mb.toFixed(1) : Math.round(mb) });
 }
 

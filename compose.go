@@ -220,76 +220,18 @@ func (a *App) hover(px, py int) {
 	a.emit("hover", ev)
 }
 
-type catalogMatch struct {
-	Name  string  `json:"name"`
-	PMRA  float64 `json:"pmra"`
-	PMDec float64 `json:"pmdec"`
-}
-
-type selectionEvent struct {
-	RA           float64           `json:"ra"`
-	Dec          float64           `json:"dec"`
-	Band         int               `json:"band"`
-	Moving       bool              `json:"moving"`
-	PMRA         float64           `json:"pmra"`
-	PMDec        float64           `json:"pmdec"`
-	PMRAErr      float64           `json:"pmraErr"`
-	PMDecErr     float64           `json:"pmdecErr"`
-	Track        []sky.TrackPoint  `json:"track"`
-	Measurements []sky.Measurement `json:"measurements"`
-	Catalog      *catalogMatch     `json:"catalog"`
-}
-
+// Select picks the source under (x, y); the server refines the position,
+// follows it through the frames and measures it.
 func (a *App) Select(x, y float64) {
-	f, v := a.field, a.view
-	if f == nil {
+	if a.field == nil {
 		return
 	}
-	if fr := f.Frames[v.Band][v.Visit]; fr.Loaded && fr.Available {
-		if cx, cy, snr := sky.Centroid(fr, f.N, x, y, 2); snr >= 5 {
-			x, y = cx, cy
-		}
-	}
-	a.sel = &Selection{X: x, Y: y, Visit: v.Visit, Band: v.Band}
+	a.sel = &Selection{X: x, Y: y, Visit: a.view.Visit, Band: a.view.Band}
+	a.selTimer = 0
 	a.measureSelection()
 }
 
 func (a *App) ClearSelection() {
 	a.sel = nil
 	a.emit("select", nil)
-}
-
-func (a *App) measureSelection() {
-	f, s := a.field, a.sel
-	s.Motion = f.Track(s.Band, s.Visit, s.X, s.Y)
-	s.Measurements = f.Measure(s.Motion)
-	a.selDirty = false
-	a.selTimer = 0.5
-
-	x, y := s.Motion.At(f.Visits[s.Visit].MJD)
-	ra, dec := f.WCS.ToSky(x, y)
-	ev := selectionEvent{
-		RA: ra, Dec: dec, Band: s.Band, Moving: s.Motion.Moving,
-		Track: s.Motion.Points, Measurements: s.Measurements,
-	}
-	ev.PMRA, ev.PMDec = s.Motion.ProperMotion()
-	ev.PMRAErr, ev.PMDecErr = s.Motion.ProperMotionErr()
-
-	best := 1.5
-	for i := range f.Sources {
-		src := &f.Sources[i]
-		if !src.Catalog {
-			continue
-		}
-		sx, sy := f.WCS.ToPixel(src.Position(f.Visits[s.Visit].MJD))
-		if d := math.Hypot(sx-x, sy-y); d < best {
-			best = d
-			name := src.Name
-			if name == "" {
-				name = "Gaia DR3"
-			}
-			ev.Catalog = &catalogMatch{name, src.PMRA / 1000, src.PMDec / 1000}
-		}
-	}
-	a.emit("select", ev)
 }

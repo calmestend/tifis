@@ -1,6 +1,6 @@
 # Protocolos, transferencia de datos y arquitectura
 
-Este documento describe cómo SPHEREx Sky Timeline obtiene, transporta, guarda y procesa los datos: qué servicios consulta, con qué protocolos, en qué formatos, cómo se reparten las peticiones y qué pasa cuando algo falla. Las operaciones numéricas (coordenadas, reproyección, fotometría, HEALPix…) están explicadas paso a paso, con código Python equivalente, en el notebook [`operaciones.ipynb`](operaciones.ipynb).
+Este documento describe cómo SPHEREx Sky Timeline obtiene, transporta, guarda y procesa los datos: qué servicios consulta, con qué protocolos, en qué formatos, cómo se reparten las peticiones y qué pasa cuando algo falla. Las operaciones numéricas (coordenadas, reproyección, fotometría…) están explicadas paso a paso, con datos reales, en el notebook [`operaciones.ipynb`](operaciones.ipynb).
 
 ## 1. Arquitectura
 
@@ -11,36 +11,46 @@ flowchart LR
     WASM["Motor Go<br/>(WebAssembly + raylib)"]
     UI <-- "syscall/js<br/>JSON" --> WASM
   end
-  subgraph Proxy["Proxy Go (cmd/proxy)"]
-    API["/api/*"]
+  subgraph Servidor["Servidor Python (server/)"]
+    API["/api/*<br/>astropy · astroquery · photutils"]
     STATIC["web/ estático"]
-    CACHE[("Caché en disco<br/>~/.cache/spherex-proxy")]
+    CACHE[("Caché en disco<br/>spherex-proxy")]
   end
-  WASM -- "HTTP GET /api/…" --> API
-  UI -- "HTTP GET /api/health,<br/>/api/gaia/progress" --> API
+  WASM -- "HTTP GET /api/field, frame,<br/>catalog, measure" --> API
+  UI -- "HTTP GET /api/health" --> API
   API --- CACHE
-  API -- "SIA v2 (VOTable)<br/>TAP/ADQL (CSV)" --> IRSA["IRSA (Caltech/IPAC)"]
+  API -- "SIA v2 y TAP/ADQL<br/>(astroquery.ipac.irsa)" --> IRSA["IRSA (Caltech/IPAC)"]
   API -- "Recortes FITS<br/>(servicio IBE)" --> IRSA
-  API -- "Listado S3 (XML)<br/>HTTP Range sobre .csv.gz" --> CDN["CDN Gaia (ESA)"]
+  API -- "TAP/ADQL asíncrono<br/>(astroquery.gaia)" --> ESA["Archivo de Gaia (ESA)"]
 ```
 
 Hay tres piezas:
 
 - **Interfaz** (`ui/`): buscador, canales, línea de tiempo, paneles. Es dueña del estado de la app (URL, reproducción, nivel) y lo envía al motor.
-- **Motor** (Go compilado a WebAssembly, con raylib para el dibujo): pide los datos al proxy, decodifica FITS, reproyecta, compone las imágenes, mide fotometría y movimiento, y dibuja el visor en un `<canvas>`.
-- **Proxy** (`cmd/proxy`): sirve la web y la API `/api/*`, habla con IRSA y con el CDN de la ESA, y guarda todo en una caché en disco.
+- **Motor** (Go compilado a WebAssembly, con raylib para el dibujo): pide al servidor el plan del campo y los fotogramas ya reproyectados, compone la imagen que toca (época, diferencia o suma), la colorea y la dibuja en un `<canvas>`. La composición se queda en el navegador porque se recalcula en cada fotograma de la reproducción. Al elegir una fuente, pide la medida al servidor y dibuja el resultado.
+- **Servidor** (`server/`, Python): sirve la web y la API `/api/*`. Habla con IRSA y con el archivo de la ESA, lee los FITS, reproyecta, mide fotometría y movimiento, genera la simulación y guarda todo en una caché en disco.
 
-### Por qué hace falta el proxy
+| Archivo | Qué hace |
+|---|---|
+| `server/main.py` | HTTP, validación, rutas, precalentamiento. |
+| `server/archive.py` | IRSA (SIA, TAP, recortes), Gaia DR3, CatWISE2020, fusión de catálogos, caché. |
+| `server/science.py` | Rejilla, reproyección, banderas, estadística, fotometría, centroide, seguimiento, objetos de prueba. |
+| `server/sim.py` | Simulación. |
+
+### Por qué hace falta el servidor
 
 Se comprobó desde un navegador real:
 
 | Servicio | `Access-Control-Allow-Origin` | Desde el navegador |
 |---|---|---|
 | IRSA TAP, SIA y recortes | no se envía | bloqueado por CORS |
-| CDN de Gaia (ESA) | `*` | permitido, pero cada archivo pesa ~230 MB |
 | Mirror de Sesame en Harvard | `*` | permitido (búsqueda por nombre) |
 
-IRSA no permite peticiones desde otra web, así que el proxy hace de intermediario y sirve la app desde **el mismo origen** que la API: el navegador nunca hace peticiones entre orígenes a `/api`. Para Gaia el proxy no es obligatorio, pero se usa por eficiencia (sección 3.6). Además, el proxy recorta lo que viaja al navegador (quita la capa PSF de los FITS) y cachea respuestas que en IRSA tardan de segundos a minutos.
+IRSA no permite peticiones desde otra web, así que el servidor hace de intermediario y sirve la app desde **el mismo origen** que la API: el navegador nunca hace peticiones entre orígenes a `/api`. Además:
+
+- **La ciencia se hace con las librerías de referencia** (astropy, astroquery, photutils), las mismas de los tutoriales de IRSA.
+- **Viaja mucho menos**: un recorte pesa ~4 MB (130–190 KB sin la PSF) y el motor recibe ~28 KB por fotograma.
+- **Se cachea lo lento**: las consultas a IRSA tardan de segundos a minutos.
 
 ## 2. Flujo de una sesión
 
@@ -48,71 +58,66 @@ IRSA no permite peticiones desde otra web, así que el proxy hace de intermediar
 sequenceDiagram
   participant U as Interfaz
   participant M as Motor (WASM)
-  participant P as Proxy
+  participant S as Servidor
   participant I as IRSA
-  participant G as CDN Gaia
-  U->>P: GET /api/health
-  P-->>U: {"ok":true} → modo datos reales
+  participant G as ESA (Gaia)
+  U->>S: GET /api/health
+  S-->>U: {"ok":true} → modo datos reales
+  M->>S: GET /api/targets
+  M-->>U: evento "ready" (objetos de prueba)
   U->>M: view(JSON) y open({ra, dec, fov, real})
-  M->>P: GET /api/visits?ra&dec
-  P->>I: SIA v2 (o TAP si SIA falla)
-  I-->>P: VOTable con las imágenes
-  P-->>M: JSON con exposiciones y detectores
-  M-->>U: evento "field" (visitas, temporadas, canales)
-  par recortes (6 a la vez)
-    M->>P: GET /api/cutout?path&ra&dec&size
-    P->>I: GET …/archivo.fits?center=…&size=…
-    I-->>P: FITS con 6 extensiones (~4 MB)
-    P-->>M: FITS sin EPSF (~130–190 KB)
+  M->>S: GET /api/field?ra&dec&fov
+  S->>I: SIA v2 (o TAP si SIA falla)
+  I-->>S: VOTable con las imágenes
+  S-->>M: plan: visitas, temporadas, archivo por canal
+  M-->>U: evento "field"
+  par fotogramas (6 a la vez)
+    M->>S: GET /api/frame?ra&dec&fov&path
+    S->>I: GET …/archivo.fits?center=…&size=…
+    I-->>S: FITS con 6 extensiones (~4 MB)
+    S-->>M: imagen y banderas en la rejilla (~28 KB)
     M-->>U: evento "loaded" (canal, visita, λ)
   and catálogo
-    M->>P: GET /api/catalog?ra&dec
-    P->>G: GET con Range (8 conexiones)
-    P->>I: TAP CatWISE2020
-    P-->>M: JSON Gaia + CatWISE
-    U->>P: GET /api/gaia/progress (cada 2 s mientras carga)
+    M->>S: GET /api/catalog?ra&dec&fov
+    S->>G: TAP asíncrono, Gaia DR3
+    S->>I: TAP CatWISE2020
+    S-->>M: fuentes fusionadas y cuál es el objeto de prueba
   end
+  U->>M: clic en el visor
+  M->>S: GET /api/measure?…&band&visit&x&y
+  S-->>M: movimiento, trayectoria, medidas, fuente de catálogo
+  M-->>U: evento "select"
 ```
 
-El motor empieza a descargar por las imágenes más cercanas a la cabeza de reproducción en el canal elegido, así que se puede reproducir antes de que termine la carga. La interfaz envía la vista (`view`) **antes** de abrir el campo para que esa prioridad sea correcta desde la primera petición.
+El motor empieza a descargar por las imágenes más cercanas a la cabeza de reproducción en el canal elegido, así que se puede reproducir antes de que termine la carga. La interfaz envía la vista (`view`) **antes** de abrir el campo para que esa prioridad sea correcta desde la primera petición. La medida usa los fotogramas que el servidor ya sirvió; mientras llegan más, el motor la vuelve a pedir como mucho una vez por segundo.
 
 ## 3. Protocolos y servicios externos
 
 ### 3.1 HTTP
 
-Todo viaja por HTTPS hacia fuera y por HTTP local entre navegador y proxy. Particularidades:
-
-- El **CDN de Gaia responde siempre en HTTP/2**, aunque el cliente solo ofrezca HTTP/1.1 por ALPN. Con HTTP/2, Go multiplexa todas las peticiones en una sola conexión TCP, y el límite de velocidad del CDN es por conexión. Por eso el lector por rangos crea **un cliente con su propio transporte por cada conexión** (sección 3.6).
-- Las peticiones del navegador al proxy son HTTP/1.1, y el navegador abre como mucho 6 conexiones por servidor; el motor limita sus descargas a 6 en paralelo para no hacer cola en el navegador.
+Todo viaja por HTTPS hacia fuera y por HTTP/1.1 local entre navegador y servidor. El navegador abre como mucho 6 conexiones por servidor, así que el motor limita sus descargas a 6 en paralelo para no hacer cola en el navegador.
 
 ### 3.2 IVOA SIA v2: lista de imágenes (vía principal)
 
-Simple Image Access devuelve las imágenes que contienen una posición. Es la vía que usa el tutorial de introducción de IRSA.
+Simple Image Access devuelve las imágenes que contienen una posición. Es la vía que usa el tutorial de introducción de IRSA, con astroquery:
 
-```
-GET https://irsa.ipac.caltech.edu/SIA
-    ?COLLECTION=spherex_dr1
-    &COLLECTION=spherex_qr3
-    &POS=circle <ra> <dec> 0.0003
-    &RESPONSEFORMAT=VOTABLE
+```python
+Irsa.query_sia(pos=(SkyCoord(ra, dec, unit='deg'), 0.0003 * u.deg),
+               collection=['spherex_dr1', 'spherex_qr3'])
 ```
 
-- **Respuesta**: VOTable 1.3 en XML con `TABLEDATA`. De la última tabla se usan las columnas `access_url` (URL del archivo) y `t_min` (MJD de inicio).
-- **Tiempo observado**: unos 5 s.
+- **Respuesta**: una tabla de astropy (VOTable por debajo). Se usan `access_url` (URL del archivo) y `t_min` (MJD de inicio).
+- **Tiempo observado**: de 2 a 5 s.
 - **Limitación**: SIA ve los datos nuevos con alrededor de un día de retraso respecto a TAP (la ingesta es semanal).
 
 ### 3.3 IVOA TAP con ADQL: lista de imágenes (respaldo) y CatWISE
 
-Table Access Protocol en modo síncrono, con la consulta en ADQL y la respuesta en CSV:
-
-```
-GET https://irsa.ipac.caltech.edu/TAP/sync?LANG=ADQL&FORMAT=csv&QUERY=<ADQL>
-```
+Table Access Protocol en modo síncrono (`Irsa.query_tap(adql).to_table()`).
 
 Imágenes SPHEREx que contienen un punto (la consulta del tutorial de recortes):
 
 ```sql
-SELECT a.uri, p.time_bounds_lower, p.energy_bandpassname
+SELECT a.uri, p.time_bounds_lower
 FROM spherex.artifact a
 JOIN spherex.plane p ON a.planeid = p.planeid
 WHERE 1 = CONTAINS(POINT('ICRS', <ra>, <dec>), p.poly)
@@ -131,7 +136,7 @@ TAP tarda de 30 s a varios minutos. Se usa para las imágenes solo si SIA falla 
 
 **Deduplicación de imágenes** (SIA y TAP): una misma exposición y detector puede aparecer reprocesada (`_retry`) o en dos entregas (QR3 y DR1). Del nombre `level2_<exposición>D<detector>_spx…` se saca la clave; si hay varias, se queda la de DR1 y, dentro de ella, la última por ruta.
 
-**Estructura de las exposiciones**: en cada exposición un punto del cielo cae en **una pareja de detectores** (D1+D4, D2+D5 o D3+D6), porque los dos planos focales ven el mismo cielo a través del divisor dicroico. Una visita del motor es una exposición; los otros cuatro canales no tienen imagen en ella. Las visitas separadas por más de 40 días empiezan una nueva temporada (pasada del survey).
+**Estructura de las exposiciones**: en cada exposición un punto del cielo cae en **una pareja de detectores** (D1+D4, D2+D5 o D3+D6), porque los dos planos focales ven el mismo cielo a través del divisor dicroico. Una visita es una exposición; los otros cuatro canales no tienen imagen en ella. Las visitas separadas por más de 40 días empiezan una nueva temporada (pasada del survey).
 
 ### 3.4 Servicio de recortes de IRSA (IBE)
 
@@ -144,52 +149,37 @@ GET https://irsa.ipac.caltech.edu/ibe/data/spherex/<entrega>/level2/<semana>/<ve
 
 - **Lado del recorte**: el recorte llega en la orientación del detector, rotado respecto al norte, así que debe cubrir las esquinas del campo norte-arriba en cualquier ángulo: `lado = campo × √2 × 1.02`. Para un campo de 6′ son 0.144° (unos 84 píxeles).
 - **Contenido**: un FITS multiextensión con `PRIMARY`, `IMAGE`, `FLAGS`, `VARIANCE`, `ZODI`, `EPSF` y `WCS-WAVE`.
-- **Tamaño**: `EPSF` es un cubo de PSF de unos 3.9 MB (el 97 % del archivo) que el motor no usa. **El proxy lo elimina**, y cada recorte pasa de ~4 MB a ~130–190 KB según el campo.
+- **Tamaño**: `EPSF` es un cubo de PSF de unos 3.9 MB (el 97 % del archivo) que no se usa. **El servidor lo elimina** con `astropy.io.fits` antes de guardar el recorte, que pasa de ~4 MB a ~130–190 KB.
 
-### 3.5 FITS
+### 3.5 FITS y reproyección
 
-Formato de archivo de las imágenes. El paquete `internal/fits` implementa lo mínimo:
-
-- **Estructura**: bloques de 2880 bytes. Cada HDU (cabecera + datos) es una cabecera de tarjetas de 80 caracteres ASCII terminada en `END` y rellena hasta el bloque, seguida de los datos en big-endian, también rellenos.
-- **Tamaño de los datos**: `|BITPIX|/8 × NAXIS1 × … × NAXISn`, más `PCOUNT`, por `GCOUNT`.
-- **Quitar una extensión** es copiar las demás HDU tal cual, byte a byte, sin reinterpretar nada.
-
-Extensiones y palabras clave que se usan:
+Los recortes se leen con `astropy.io.fits`. Extensiones y palabras clave que se usan:
 
 | Extensión | Contenido | Uso |
 |---|---|---|
-| `IMAGE` (float32) | Brillo superficial en MJy/sr | Imagen. `MJD-AVG` da la fecha; `CTYPE`, `CRPIX`, `CRVAL`, `PC`, `CDELT` y los polinomios SIP `A_*`, `B_*`, `AP_*`, `BP_*` dan la posición; `CTYPE1W='WAVE-TAB'`, `CRPIX1W/2W` y `PS1_*W` dan la longitud de onda. |
+| `IMAGE` (float32) | Brillo superficial en MJy/sr | Imagen. `MJD-AVG` da la fecha; el WCS principal (TAN-SIP) da la posición; el alternativo `W` (`WAVE-TAB`) da la longitud de onda. |
 | `FLAGS` (int32) | Máscara de bits por píxel | Bit *n* nombrado por `MSKNnnnn` y descrito por `MSKDnnnn`. |
 | `VARIANCE` (float32) | Varianza por píxel, (MJy/sr)² | Errores de la fotometría. |
 | `ZODI` (float32) | Modelo de luz zodiacal, no restado | Se resta para igualar el fondo entre visitas. |
-| `EPSF` | PSF efectiva | Eliminada por el proxy. |
+| `EPSF` | PSF efectiva | Eliminada por el servidor. |
 | `WCS-WAVE` (tabla binaria) | Rejilla 9×9 de puntos de control con (λ, ancho de banda) | Longitud de onda de cada píxel. |
 
-### 3.6 CDN de Gaia DR3 (ESA)
+**Reproyección** (`science.process`): todas las imágenes se llevan a la misma rejilla, una proyección TAN centrada en el campo, de 6.15″ por píxel, con el norte arriba y el este a la izquierda. Para cada píxel de la rejilla se busca su posición en el recorte con `astropy.wcs` (`all_world2pix`, que aplica la distorsión SIP), se interpola bilinealmente `IMAGE − ZODI` y `VARIANCE` saltando los píxeles no finitos, y las banderas se toman del píxel más cercano. Lo que cae fuera del recorte queda como `MISSING_DATA`. La longitud de onda sale de `WCS(cabecera, fobj=hdul, key='W')` sin la distorsión, como indica el tutorial `spherex_intro`.
 
-Gaia DR3 está publicado como 3386 archivos `GaiaSource_AAAAAA-BBBBBB.csv.gz` de unos 230 MB (formato ECSV: comentarios `#` de metadatos, una línea de cabecera CSV y 152 columnas por fila).
+### 3.6 Gaia DR3 (archivo de la ESA)
 
-**Listado**: el navegador de archivos del CDN lee un almacenamiento de tipo S3:
+Las fuentes de Gaia DR3 con G < 19 en el cono de 0.15° se piden con `astroquery.gaia` al TAP del archivo de la ESA:
 
+```sql
+SELECT source_id, ra, dec, pmra, pmdec, phot_g_mean_mag FROM gaiadr3.gaia_source_lite
+WHERE 1 = CONTAINS(POINT(ra, dec), CIRCLE(<ra>, <dec>, 0.15)) AND phot_g_mean_mag < 19
 ```
-GET https://gaia.eu-1.cdn77-storage.com/?prefix=Gaia/gdr3/gaia_source/&delimiter=/[&marker=<última clave>]
-```
 
-La respuesta es XML (`ListBucketResult`) con `Contents/Key`, `Contents/Size` e `IsTruncated`, paginada de 1000 en 1000 claves con `marker`. El índice resultante se guarda en `gaia/index.json`.
+- **Tabla `gaia_source_lite`**: tiene las columnas necesarias y responde antes que `gaia_source`.
+- **Consulta asíncrona** (`launch_job_async`): la síncrona se corta en 2000 filas y caduca en los campos densos. En el bulbo galáctico el cono trae unas 49 000 fuentes en ~14 s; en Barnard, unas 1900 en ~8 s.
+- Los movimientos propios `null` se guardan como 0.
 
-**Organización espacial**: los números del nombre de archivo son el **rango de píxeles HEALPix de nivel 8** (esquema anidado, unos 0.23° de lado) que contiene, y las filas van ordenadas por `source_id`, que lleva el píxel de nivel 12 en sus bits altos (`source_id >> 35`). Así, el píxel de nivel 8 de una fila es `source_id >> 43`, y para un punto del cielo se sabe qué archivo leer sin descargar nada.
-
-**Por qué no se puede saltar a mitad de un archivo**: cada `.csv.gz` es un único flujo gzip, sin puntos de sincronización. Para llegar a un píxel hay que descomprimir desde el principio.
-
-**Método de transferencia** (streaming por teselas):
-
-1. El campo de visión (cono de 0.15° más margen) se traduce en los píxeles de nivel 8 que toca, y cada píxel en su archivo.
-2. El archivo se descarga con **peticiones `Range` en paralelo** (`Range: bytes=a-b`, respuesta `206 Partial Content`): trozos de 4 MiB, 8 conexiones independientes, como mucho 8 trozos en memoria (32 MiB). Un lector los entrega **en orden** al descompresor gzip.
-3. Las líneas se leen sobre la marcha. Cada vez que cambia el píxel de nivel 8, la tesela anterior se escribe en disco y se avisa a quien la estaba esperando.
-4. La petición de la app se responde **en cuanto pasan sus píxeles**. El resto del archivo se sigue procesando en segundo plano, sin estar ligado a ninguna petición, para cachear también las zonas vecinas.
-5. Al terminar el archivo se escribe la marca `done-<archivo>`.
-
-Velocidad medida: unos 1 MB/s por conexión y de 0.8 a 4 MB/s en total según el momento. Un archivo nuevo tarda de 1 a 6 minutos; después la zona responde al instante. Se hace en el proxy y no en el navegador para no repetir cientos de MB por usuario y para compartir la caché.
+Antes el proyecto descargaba los archivos masivos del CDN de la ESA (3386 archivos de ~230 MB) y los partía en teselas HEALPix; una zona nueva tardaba de 1 a 6 minutos.
 
 ### 3.7 Sesame (búsqueda por nombre)
 
@@ -209,7 +199,7 @@ El motor corre en el mismo hilo que la página. Su bucle de dibujo cede el contr
 
 | Función | Argumentos | Efecto |
 |---|---|---|
-| `open(json)` | `{ra, dec, fov, name, real}` | Abre un campo; `real` usa el proxy. |
+| `open(json)` | `{ra, dec, fov, name, real}` | Abre un campo; `real: false` pide la simulación. |
 | `view(json)` | `{band, mode, visit, ref, flags, catalog, tint}` | Canal (0–5), modo (`epoch`/`diff`/`sum`), visita, referencia (−1 automática) y capas. |
 | `zoom(f)`, `fit()` | factor | Zoom del visor. |
 | `resize(w, h)` | píxeles | Tamaño del canvas. |
@@ -220,114 +210,119 @@ El motor corre en el mismo hilo que la página. Su bucle de dibujo cede el contr
 
 | Evento | Contenido |
 |---|---|
-| `ready` | Los 5 objetos de prueba con posición actual y canal y modo sugeridos. |
+| `ready` | Los 5 objetos de prueba con posición actual y canal y modo sugeridos (de `/api/targets`). |
 | `status` | Fase (`visits`, `catalog`), estado (`loading`, `done`, `empty`, `error`), error, número de elementos y catálogos que faltaron. |
 | `field` | Visitas (fecha, temporada, sub-banda), disponibilidad por canal, tamaño, si es real y unidad de flujo. |
 | `loaded` | Imágenes recién cargadas: canal, visita, λ en el centro y si se pudo leer. Incluye el progreso total. |
 | `frame` | La imagen mostrada: fecha, λ, referencia usada, archivo, fondo, ruido, píxeles marcados y número de imágenes apiladas. |
 | `hover` | Píxel bajo el cursor: coordenadas, valor y banderas. |
-| `select` | Fuente seleccionada: posición, movimiento propio con errores, trayectoria, todas las medidas (canal, visita, λ, flujo, error, fiable) y la fuente de catálogo que coincide. |
+| `select` | La respuesta de `/api/measure` tal cual: posición, movimiento propio con errores, trayectoria, todas las medidas (canal, visita, λ, flujo, error, fiable) y la fuente de catálogo que coincide. |
 
-## 5. API del proxy
+## 5. API del servidor
 
-Todas las respuestas de `/api/*` llevan `Access-Control-Allow-Origin: *`. Los errores son JSON `{"error": "…"}` con estado 400 (parámetros inválidos) o 502 (falló el servicio externo).
+Todas las respuestas de `/api/*` llevan `Access-Control-Allow-Origin: *`. Los errores son JSON `{"error": "…"}` con estado 400 (parámetros inválidos), 404 (no existe), 422 (recorte ilegible) o 502 (falló un servicio externo).
+
+Los campos se identifican con `ra`, `dec` (grados) y `fov` (minutos de arco, de 4 a 12). Un campo simulado lleva además `sim=1` y `now`, el día (MJD) para el que se planificó, que devuelve `/api/field`: así cada petición posterior ve el mismo calendario. Las coordenadas de píxel siguen la convención del motor: el píxel *i* cubre [*i*, *i*+1).
 
 | Método y ruta | Parámetros | Respuesta | Caché |
 |---|---|---|---|
 | `GET /api/health` | — | `{"ok":true}` | — |
-| `GET /api/visits` | `ra`, `dec` (grados) | `{ra, dec, source: "SIA"\|"TAP", fetched, visits: [{path, mjd, detector, exposure, release}]}` | 24 h en disco; cabecera `X-Cache: HIT\|MISS` |
-| `GET /api/cutout` | `path` (ruta del archivo en el archivo de IRSA), `ra`, `dec`, `size` (≤ 0.3°) | FITS (`application/fits`) sin `EPSF` | Permanente en disco; `Cache-Control: public, max-age=31536000, immutable` |
-| `GET /api/catalog` | `ra`, `dec` | `{ra, dec, radius: 0.15, sources: [{catalog, name, ra, dec, pmra, pmdec, mjd, mag}], missing?: ["CatWISE2020"]}` | Permanente si está completa; CatWISE tiene su propia entrada |
-| `GET /api/gaia/progress` | `ra`, `dec` | `[{file, fraction, mb}]` de los archivos de Gaia que se están descargando para ese campo | — |
+| `GET /api/targets` | — | `[{id, name, aliases, ra, dec, pmra, pmdec, band, mode}]` en la posición de hoy | — |
+| `GET /api/field` | campo | `{real, ra, dec, npix, target, name, fluxUnit, now?, visits: [{mjd, season, sub}], files: [6][visitas]}`; `files` tiene la ruta del archivo o `""` si ese canal no tiene imagen en esa visita | lista de imágenes 24 h |
+| `GET /api/frame` | campo y `path` (real) o `c`, `v` (simulado) | Binario (sección 6) | Permanente; `Cache-Control: immutable` en los reales |
+| `GET /api/catalog` | campo | `{sources: [{catalog, name, ra, dec, pmra, pmdec, mjd, mag}], target, missing}` | Gaia y CatWISE, permanentes |
+| `GET /api/measure` | campo, `band`, `visit`, `x`, `y` | `{ra, dec, band, moving, pmra, pmdec, pmraErr, pmdecErr, x0, y0, t0, vx, vy, track: [{v, x, y}], measurements: [{c, v, t, l, f, e, ok}], catalog}` | — |
+| `GET /api/visits` | `ra`, `dec` | `{ra, dec, source: "SIA"\|"TAP", fetched, visits: [{path, mjd, detector, exposure, release}]}` | 24 h; `X-Cache: HIT\|MISS` |
+| `GET /api/cutout` | `path`, `ra`, `dec`, `size` (≤ 0.3°) | FITS (`application/fits`) sin `EPSF` | Permanente |
 | `GET /…` | — | Archivos de `web/` | `Cache-Control: no-cache` (una recompilación se ve al recargar) |
 
-Unidades en el catálogo: `pmra` y `pmdec` en mas/año (`pmra` incluye cos δ), `mjd` es la época de la posición (57388.5 = J2016.0 para Gaia, 57170.0 = 2015.4 para CatWISE) y `mag` es G (Gaia) o W2 (CatWISE). Solo se incluyen las fuentes de Gaia con G < 19.
+Unidades: `pmra` y `pmdec` en mas/año en el catálogo (`pmra` incluye cos δ) y en ″/año en la medida; `mjd` del catálogo es la época de la posición (57388.5 = J2016.0 para Gaia, 57170.0 = 2015.4 para CatWISE); `mag` es G (Gaia) o W2 (CatWISE). En la medida, `f` y `e` van en mJy (unidades propias en la simulación) y `l` en µm. `target` es el índice del objeto de prueba en `sources`, o −1.
 
-**Validación**: `path` debe empezar por `ibe/data/spherex/`, terminar en `.fits` y no contener `..`, `?`, `#` ni `\`. Así el proxy no sirve para pedir cualquier otra cosa a IRSA ni a otros servidores.
+**Validación**: `path` debe empezar por `ibe/data/spherex/`, terminar en `.fits` y no contener `..`, `?`, `#` ni `\`. Así el servidor no sirve para pedir cualquier otra cosa a IRSA ni a otros servidores.
 
-## 6. Caché
+## 6. Formatos
 
-Todo vive en `~/.cache/spherex-proxy` (o en la carpeta indicada con `-cache`).
+**Fotograma para el motor** (`/api/frame`): binario little-endian, sin compresión.
 
-| Qué | Clave o ruta | Validez |
+| Bytes | Contenido | Tipo |
+|---|---|---|
+| 0–39 | MJD, λ en el centro (µm), fondo, σ, sub-banda | 5 × float64 |
+| 40 … | Imagen N×N, fila a fila, norte arriba | float32 |
+| … | Banderas N×N | uint32 |
+
+Para un campo de 6′ (N = 59) son 27 888 bytes.
+
+**Fotograma en caché**: un `.npz` de numpy con la imagen, las banderas, la varianza y la longitud de onda de cada píxel; la medida lo lee de ahí sin volver a reproyectar.
+
+## 7. Caché
+
+Todo vive en `~/Library/Caches/spherex-proxy` en macOS o `~/.cache/spherex-proxy` en Linux (o en la carpeta indicada con `--cache`). Es la misma carpeta y el mismo esquema de claves que usaba el proxy en Go, así que las listas de imágenes, los recortes y CatWISE que ya estaban guardados se aprovechan. La carpeta `gaia/` de esa versión ya no se usa y se puede borrar.
+
+| Qué | Clave | Validez |
 |---|---|---|
 | Lista de imágenes | `visits <ra> <dec>` | 24 h (IRSA añade datos cada semana) |
 | Recorte sin EPSF | `cutout <path> <ra> <dec> <size>` | permanente (la ruta incluye la versión de procesado) |
-| Catálogo completo | `catalog <ra> <dec> 0.150 gaia-cdn` | permanente |
+| Fotograma reproyectado | `frame1 <path> <ra> <dec> <fov>` | permanente (`frame1` cambia si cambia el procesado) |
+| Gaia DR3 | `gaia <ra> <dec> 0.150` | permanente |
 | CatWISE | `catwise <ra> <dec> 0.150` | permanente |
-| Teselas de Gaia | `gaia/tiles/<píxel/1000>/<píxel>.bin` | permanente |
-| Archivo de Gaia terminado | `gaia/done-<archivo>` | permanente |
-| Índice del CDN | `gaia/index.json` | permanente |
 
-- **Ubicación de las entradas**: se guardan en `<sha256(clave)[:2]>/<sha256(clave)>`.
-- **Escritura atómica**: archivo temporal y `rename`, así una caída nunca deja medio archivo.
-- **Peticiones simultáneas**: si llegan varias con la misma clave, solo se ejecuta una vez la consulta y las demás esperan su resultado.
-- **Redondeo**: las posiciones se redondean a 0.0005° (1.8″), en el proxy y en el motor. La posición actual de un objeto rápido, como WISE 0855 a 8″/año (0.022″/día), cambia el sexto decimal del centro (0.0036″) cada ~4 horas; sin redondeo la clave de cada recorte cambiaría varias veces al día y casi nunca coincidiría con las del precalentamiento. Con 1.8″ la clave dura unas 11 semanas.
+- **Ubicación de las entradas**: `<sha256(clave)[:2]>/<sha256(clave)>`.
+- **Escritura atómica**: archivo temporal y `os.replace`, así una caída nunca deja medio archivo.
+- **Peticiones simultáneas**: si llegan varias con la misma clave, la consulta se hace una sola vez y las demás esperan su resultado.
+- **En memoria**: los últimos 3000 fotogramas leídos y 3000 simulados, para que la medida no relea el disco.
+- **Redondeo**: las posiciones se redondean a 0.0005° (1.8″), en el servidor y en el motor. La posición actual de un objeto rápido, como WISE 0855 a 8″/año (0.022″/día), cambia el sexto decimal del centro (0.0036″) cada ~4 horas; sin redondeo la clave de cada recorte cambiaría varias veces al día y casi nunca coincidiría con las del precalentamiento. Con 1.8″ la clave dura unas 11 semanas.
 
-**Formato de las teselas de Gaia**: binario little-endian, 40 bytes por fuente, sin cabecera.
+## 8. Concurrencia
 
-| Bytes | Campo | Tipo |
-|---|---|---|
-| 0–7 | `source_id` | int64 |
-| 8–15 | `ra` (grados, J2016) | float64 |
-| 16–23 | `dec` (grados, J2016) | float64 |
-| 24–27 | `parallax` (mas) | float32 |
-| 28–31 | `pmra` (mas/año) | float32 |
-| 32–35 | `pmdec` (mas/año) | float32 |
-| 36–39 | `phot_g_mean_mag` | float32 |
-
-Los valores `null` del CSV se guardan como NaN. Un píxel sin archivo de tesela, dentro de un archivo marcado como terminado, no tiene fuentes.
-
-## 7. Concurrencia
-
-Cada tipo de petición tiene sus propios turnos, para que lo lento no bloquee lo urgente:
+El servidor atiende cada conexión en su propio hilo. Cada tipo de petición externa tiene sus propios turnos, para que lo lento no bloquee lo urgente:
 
 | Dónde | Límite | Motivo |
 |---|---|---|
-| Motor → proxy (recortes) | 6 a la vez | Conexiones por servidor del navegador. |
-| Proxy → IRSA (recortes) | 8 (`-parallel`) | Los tutoriales de IRSA recomiendan de 7 a 12. |
-| Proxy → IRSA (listas de imágenes) | 2 | Camino crítico de la app; consultas pesadas. |
-| Proxy → IRSA (catálogos TAP) | 2 | Muy lentas; no deben ocupar los turnos de lo anterior. |
-| Proxy → CDN de Gaia | 2 archivos × 8 conexiones | Ancho de banda y CPU de descompresión. |
+| Motor → servidor (fotogramas) | 6 a la vez | Conexiones por servidor del navegador. |
+| Servidor → IRSA (recortes) | 8 (`--parallel`) | Los tutoriales de IRSA recomiendan de 7 a 12. |
+| Servidor → IRSA (listas de imágenes) | 2 | Camino crítico de la app; consultas pesadas. |
+| Servidor → IRSA (CatWISE) | 2 | Muy lentas; no deben ocupar los turnos de lo anterior. |
+| Servidor → ESA (Gaia) | 1 | El cliente de astroquery guarda el estado de la última respuesta. |
+| Motor → servidor (medida) | 1, como mucho una por segundo | Se repite mientras llegan fotogramas o el catálogo. |
 
-- **Cancelación**: la espera por un turno termina si el navegador abandona la petición. Una vez empezada, la descarga sigue hasta el final (dentro de su plazo) para que el resultado quede en caché.
-- **Precalentamiento**: al arrancar, el proxy pide en serie las listas de imágenes y luego los catálogos de los 5 objetos de prueba, para no saturar los servicios.
+- **Peticiones abandonadas**: una descarga empezada sigue hasta el final para que el resultado quede en caché, aunque el navegador ya no espere.
+- **Precalentamiento**: al arrancar, el servidor pide en serie las listas de imágenes y luego los catálogos de los 5 objetos de prueba, para no saturar los servicios.
 
-## 8. Tolerancia a fallos
+## 9. Tolerancia a fallos
 
 | Capa | Qué se reintenta | Cómo |
 |---|---|---|
-| Proxy → IRSA | Errores de red y respuestas 5xx | 3 intentos, con esperas de 1 s y 2 s. Los 4xx no se reintentan. |
-| Proxy → CDN de Gaia | Cada trozo de 4 MiB | 4 intentos, con esperas de 2, 4 y 6 s. |
-| Motor → proxy | Recortes con error transitorio (red o 5xx) | Vuelven a la cola tras 20, 40, 80 y 160 s; después quedan como hueco en la línea de tiempo. |
+| Servidor → IRSA y ESA | Errores de red y respuestas 5xx | 3 intentos, con esperas de 1 s y 2 s. Los 4xx no se reintentan. |
+| Motor → servidor | Fotogramas con error transitorio (red o 5xx) | Vuelven a la cola tras 20, 40, 80 y 160 s; después quedan como hueco en la línea de tiempo. |
 | Listas de imágenes | SIA caído | Se repite la consulta por TAP. |
-| Catálogo | CatWISE lento o caído | Se espera como mucho 20 s tras tener Gaia; se responde con Gaia y `missing: ["CatWISE2020"]`, sin guardar en caché, y CatWISE sigue en segundo plano para la próxima vez. |
+| Catálogo | CatWISE lento o caído | Se espera como mucho 20 s tras tener Gaia; se responde con Gaia y `missing: ["CatWISE2020"]`, y CatWISE sigue en segundo plano para la próxima vez. |
 
-Plazos por petición, contados una vez obtenido turno: 90 s para un recorte, 8 min para una consulta TAP o SIA.
+Plazos: 90 s sin datos para un recorte y 10 minutos sin datos para cualquier otra conexión (las consultas TAP pueden tardar minutos antes del primer byte).
 
-Un recorte ilegible (FITS corrupto o sin las extensiones necesarias) no se reintenta: se marca como hueco. Los errores llegan a la interfaz como estados (`status`) con mensajes en lenguaje llano y la opción de pasar a la simulación.
+Un recorte ilegible (FITS corrupto o sin las extensiones necesarias) no se reintenta: el servidor responde 422 y el motor lo marca como hueco. Los errores llegan a la interfaz como estados (`status`) con mensajes en lenguaje llano y la opción de pasar a la simulación.
 
-## 9. Rendimiento observado
+## 10. Rendimiento observado
 
 | Operación | Tiempo o tamaño |
 |---|---|
-| SIA, lista de imágenes | ~5 s (358 imágenes para Barnard) |
+| SIA, lista de imágenes | 2–5 s (358 imágenes para Barnard) |
 | TAP, lista de imágenes | 27–58 s |
-| TAP, cono de Gaia de 0.15° en IRSA (ya no se usa) | ~150 s |
 | TAP, CatWISE | ~130 s, con frecuentes 502 durante las pruebas |
-| Recorte de 6′ | 1.4 s en condiciones normales; 10–90 s con IRSA degradado |
-| Recorte | 4 MB → 130–190 KB sin EPSF |
-| Archivo de Gaia (230 MB) | 1–6 min la primera vez; una zona del cielo ocupa ~23 MB en teselas |
+| TAP de la ESA, Gaia DR3 | ~8 s en Barnard, ~14 s en el bulbo galáctico |
+| Recorte de 6′ | 0.7–1.4 s en condiciones normales; 10–90 s con IRSA degradado |
+| Reproyección de un recorte | ~50 ms la primera vez; después sale de la caché |
+| Fotograma que recibe el motor | 28 KB (6′) frente a 130–190 KB del recorte sin EPSF |
+| Medida de una fuente | 0.2–0.7 s con 100–300 fotogramas |
 | Cualquier respuesta cacheada | milisegundos |
 
-## 10. Convenciones
+## 11. Convenciones
 
-- **Coordenadas**: ICRS en grados. Los píxeles del motor van con el norte arriba y el este a la izquierda, a 6.15″ por píxel. En la rejilla del motor el píxel *i* cubre [*i*, *i*+1); en los recortes FITS se usa la convención de astropy (base 0, el centro del primer píxel en 0).
+- **Coordenadas**: ICRS en grados. La rejilla del campo va con el norte arriba y el este a la izquierda, a 6.15″ por píxel. En la API y en el motor el píxel *i* cubre [*i*, *i*+1); dentro del servidor se usa la convención de astropy y photutils (el centro del píxel *i* en *i*).
 - **Tiempo**: MJD. Épocas de referencia: J2000 (posiciones de los objetos de prueba, de Simbad), J2016.0 (Gaia DR3) y MJD 57170 (CatWISE2020).
 - **Unidades**:
   - Imágenes en MJy/sr.
   - Fotometría en mJy: suma en la apertura × ángulo sólido del píxel en sr × 10⁹.
   - Longitudes de onda en µm.
-  - Movimientos propios en mas/año en los datos y en ″/año en la interfaz.
+  - Movimientos propios en mas/año en los catálogos y en ″/año en la medida y la interfaz.
 
 La simulación usa las mismas estructuras y bits de banderas que los datos reales, así que todo el código posterior (composición, fotometría, seguimiento) es común.

@@ -1,0 +1,6 @@
+# Servidor (server/): python -m venv .venv && .venv/bin/pip install -r requirements.txt
+astropy>=7
+astroquery>=0.4.10
+numpy>=2
+photutils>=2
+scipy>=1.13

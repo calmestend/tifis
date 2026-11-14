@@ -13,7 +13,7 @@ import (
 // events to globalThis.skyUI.event(kind, json). The HTML side owns the app
 // state (URL, playback); the engine renders and measures.
 func platformInit(a *App) {
-	// The page and the IRSA proxy share the origin.
+	// The page and the server share the origin.
 	a.api = js.Global().Get("location").Get("origin").String()
 	ui := js.Global().Get("skyUI")
 	a.emit = func(kind string, payload any) {
@@ -68,7 +68,7 @@ func platformInit(a *App) {
 		}),
 	}
 	js.Global().Set("skyEngine", js.ValueOf(api))
-	a.emit("ready", map[string]any{"targets": targets()})
+	a.announce()
 }
 
 func platformUpdate(*App, float64) {}

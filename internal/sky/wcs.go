@@ -9,8 +9,7 @@ const (
 	deg    = math.Pi / 180
 	arcsec = deg / 3600
 
-	MJDUnix  = 40587.0
-	MJDJ2000 = 51544.5
+	MJDUnix = 40587.0
 )
 
 // WCS is a gnomonic projection with north up, east left and square pixels.
@@ -47,39 +46,6 @@ func (w WCS) ToSky(x, y float64) (ra, dec float64) {
 	return math.Mod(a/deg+360, 360), d / deg
 }
 
-// Separation returns the angular distance between two positions in degrees.
-func Separation(ra1, dec1, ra2, dec2 float64) float64 {
-	a := math.Sin((dec2 - dec1) * deg / 2)
-	b := math.Sin((ra2 - ra1) * deg / 2)
-	h := a*a + math.Cos(dec1*deg)*math.Cos(dec2*deg)*b*b
-	return 2 * math.Asin(math.Sqrt(math.Min(1, h))) / deg
-}
-
 func MJDToTime(mjd float64) time.Time {
 	return time.Unix(0, 0).UTC().Add(time.Duration((mjd - MJDUnix) * 86400e9))
-}
-
-func TimeToMJD(t time.Time) float64 {
-	return MJDUnix + float64(t.UnixNano())/86400e9
-}
-
-// Ecliptic converts equatorial coordinates (J2000) to ecliptic longitude and latitude.
-func Ecliptic(ra, dec float64) (lon, lat float64) {
-	eps := 23.4393 * deg
-	a, d := ra*deg, dec*deg
-	b := math.Asin(math.Sin(d)*math.Cos(eps) - math.Cos(d)*math.Sin(eps)*math.Sin(a))
-	l := math.Atan2(math.Sin(a)*math.Cos(eps)+math.Tan(d)*math.Sin(eps), math.Cos(a))
-	return math.Mod(l/deg+360, 360), b / deg
-}
-
-// GalacticLatitude is enough to scale star density with the Milky Way.
-func GalacticLatitude(ra, dec float64) float64 {
-	const raNGP, decNGP = 192.85948 * deg, 27.12825 * deg
-	a, d := ra*deg, dec*deg
-	return math.Asin(math.Sin(d)*math.Sin(decNGP)+math.Cos(d)*math.Cos(decNGP)*math.Cos(a-raNGP)) / deg
-}
-
-// SunLongitude is the mean ecliptic longitude of the Sun, good to about 2 degrees.
-func SunLongitude(mjd float64) float64 {
-	return math.Mod(280.460+0.9856474*(mjd-MJDJ2000), 360)
 }
