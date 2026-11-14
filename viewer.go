@@ -269,18 +269,18 @@ func (v *Viewer) drawReticle(f *sky.Field) {
 	rl.DrawLineEx(rl.NewVector2(c.X, c.Y+gap), rl.NewVector2(c.X, c.Y+gap+l), 1.5, col)
 }
 
-// drawCatalog marks catalog positions at the Gaia epoch with an arrow to where
+// drawCatalog marks catalog positions at their epoch with an arrow to where
 // the proper motion predicts the source on the current frame.
 func (v *Viewer) drawCatalog(f *sky.Field, mjd float64) {
-	for i := range f.Sources {
-		s := &f.Sources[i]
+	for i := range f.Catalog {
+		s := &f.Catalog[i]
 		// Faint catalog stars that SPHEREx cannot see would only clutter the
 		// view; fast movers are always worth an arrow.
 		fast := math.Hypot(s.PMRA, s.PMDec) > 100
-		if !s.Catalog || (s.CatalogMag > 16 && !fast && i != f.Target) {
+		if s.Mag > 16 && !fast && i != f.Target {
 			continue
 		}
-		x0, y0 := f.WCS.ToPixel(s.Position(s.CatalogEpoch()))
+		x0, y0 := f.WCS.ToPixel(s.RA, s.Dec)
 		x1, y1 := f.WCS.ToPixel(s.Position(mjd))
 		if x1 < 0 || y1 < 0 || x1 > float64(f.N) || y1 > float64(f.N) {
 			continue

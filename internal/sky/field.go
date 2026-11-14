@@ -1,46 +1,33 @@
+// Package sky holds a field as the engine shows it: visits, frames already on
+// the field grid, catalog markers and the fitted motion of a selected source.
+// The server (server/) plans fields, reprojects images and measures; the
+// engine composes and draws.
 package sky
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
-	"math/rand/v2"
 	"sort"
 )
 
 const (
 	NumChannels = 6
 	// SubBands per detector: the linear variable filters split each detector
-	// into 17 spectral channels, so every visit sees a source at a different
-	// wavelength.
+	// into 17 spectral channels.
 	SubBands = 17
 	// PixScale in arcsec per pixel.
 	PixScale = 6.15
-	// Saturation in image units; pixels above it are flagged NONLINEAR.
-	Saturation = 800
-
-	surveyStartMJD = 60796 // 2025-05-01
-	processingDays = 7
-	starBoxArcmin  = 13
+	// Aperture and annulus radii in pixels, as in server/science.py; drawn
+	// around the selected source.
+	ApertureRadius = 3.0
+	AnnulusInner   = 7.0
+	AnnulusOuter   = 16.0
 )
 
-type Channel struct {
-	Lo, Hi float64 // µm
-	Sigma  float64 // pixel noise, image units
-	FWHM   float64 // pixels
-	Zodi   float64 // typical background, image units
-}
-
-var Channels = [NumChannels]Channel{
-	{0.75, 1.10, 0.004, 1.7, 0.12},
-	{1.10, 1.60, 0.004, 1.7, 0.10},
-	{1.60, 2.40, 0.004, 1.8, 0.07},
-	{2.40, 3.80, 0.005, 1.9, 0.05},
-	{3.80, 4.40, 0.008, 2.0, 0.09},
-	{4.40, 5.00, 0.010, 2.1, 0.14},
-}
-
-func (c Channel) Lambda(sub float64) float64 {
-	return c.Lo + (sub+0.5)/SubBands*(c.Hi-c.Lo)
+// Channels are the wavelength ranges of the six detectors, in µm.
+var Channels = [NumChannels]struct{ Lo, Hi float64 }{
+	{0.75, 1.10}, {1.10, 1.60}, {1.60, 2.40}, {2.40, 3.80}, {3.80, 4.40}, {4.40, 5.00},
 }
 
 // Flag is the SPHEREx FLAGS bitmask; bit n is named by keyword MSKNnnnn in the
@@ -56,15 +43,13 @@ var flagBits = map[string]uint{
 }
 
 const (
-	FlagTransient Flag = 1 << 0
 	FlagMissing   Flag = 1 << 9
-	FlagHot       Flag = 1 << 10
 	FlagNonlinear Flag = 1 << 15
 )
 
-// BadMask holds the flags that make a pixel unreliable for photometry: the list
-// the SPHEREx Source Discovery Tool uses for its CONTAINS_BAD_PIXEL warning.
-// SOURCE, FULLSAMPLE, PHANMISS and OUTLIER are informational and not included.
+// BadMask holds the flags that make a pixel unreliable: the list the SPHEREx
+// Source Discovery Tool uses for its CONTAINS_BAD_PIXEL warning, the same as
+// the server's. SOURCE, FULLSAMPLE, PHANMISS and OUTLIER are informational.
 var BadMask = func() Flag {
 	var m Flag
 	for _, n := range []string{"TRANSIENT", "OVERFLOW", "SUR_ERROR", "NONFUNC", "DICHROIC",
@@ -75,8 +60,8 @@ var BadMask = func() Flag {
 	return m
 }()
 
-// Bad reports whether a pixel should be left out of measurements. Saturated
-// pixels still carry signal, so callers that want them can mask NONLINEAR out.
+// Bad reports whether a pixel should be left out. Saturated pixels still carry
+// signal, so callers that want them can mask NONLINEAR out.
 func (f Flag) Bad() bool { return f&BadMask != 0 }
 
 // Names lists the problem flags set in f.
@@ -91,12 +76,11 @@ func (f Flag) Names() []string {
 	return out
 }
 
-// Visit is one pointing that covers the field; the six detectors observe it at
-// the same time, each through the same position of its filter.
+// Visit is one exposure covering the field.
 type Visit struct {
-	MJD     float64
-	Season  int
-	SubBand float64
+	MJD     float64 `json:"mjd"`
+	Season  int     `json:"season"`
+	SubBand float64 `json:"sub"` // -1 until a frame of the visit arrives
 }
 
 type Frame struct {
@@ -105,23 +89,11 @@ type Frame struct {
 	Lambda         float64 // µm at the field center
 	Available      bool
 	Loaded         bool
-	File           string // archive path for real data
+	File           string
 	Image          []float32
-	Variance       []float32 // nil for simulated frames
 	Flags          []Flag
 	Background     float64
 	Sigma          float64
-	// waveAt gives the wavelength at a sky position; with the linear variable
-	// filters it changes across the frame. nil means Lambda everywhere.
-	waveAt func(ra, dec float64) float64
-}
-
-// LambdaAt is the wavelength the frame measured at a sky position.
-func (fr *Frame) LambdaAt(ra, dec float64) float64 {
-	if fr.waveAt == nil {
-		return fr.Lambda
-	}
-	return fr.waveAt(ra, dec)
 }
 
 type Field struct {
@@ -132,242 +104,74 @@ type Field struct {
 	FOV      float64 // arcmin
 	Visits   []Visit
 	Frames   [NumChannels][]*Frame
-	Sources  []Source
-	Target   int // index in Sources, or -1
-	EclLat   float64
+	Catalog  []Source
+	Target   int // index in Catalog, or -1
 	Real     bool
-	// FluxScale turns an aperture sum of pixel values into FluxUnit.
-	FluxScale float64
-	FluxUnit  string
-	seed      uint64
+	FluxUnit string
+	// Query names the field in every request to the server.
+	Query string
 }
 
-// NewField plans a simulated cutout: which visits cover the position, at which
-// wavelengths, and what is in the sky. Pixels are produced later by Load.
-func NewField(ra, dec, fovArcmin, nowMJD float64) *Field {
-	n := max(16, int(math.Round(fovArcmin*60/PixScale)))
-	f := &Field{
-		WCS:       WCS{RA: ra, Dec: dec, Scale: PixScale, CX: float64(n) / 2, CY: float64(n) / 2},
-		N:         n,
-		FOV:       fovArcmin,
-		Target:    -1,
-		FluxScale: 1,
-		FluxUnit:  "",
-		seed:      hashString(fmt.Sprintf("%.4f %.4f", ra, dec)),
+// LoadFrame decodes a frame as the server sends it, all little-endian: five
+// float64 (MJD, λ at the center, background, sigma, sub-band) followed by the
+// image (float32) and the flags (uint32), N×N each, north up.
+func (f *Field) LoadFrame(fr *Frame, data []byte) error {
+	n := f.N * f.N
+	if len(data) != 40+8*n {
+		return fmt.Errorf("frame of %d bytes, want %d", len(data), 40+8*n)
 	}
-	r := newRand(f.seed)
-	lon, lat := Ecliptic(ra, dec)
-	f.EclLat = lat
-	f.Visits = schedule(lon, lat, nowMJD, r)
-
-	for c := range NumChannels {
-		f.Frames[c] = make([]*Frame, len(f.Visits))
-		for v, vis := range f.Visits {
-			t := MJDToTime(vis.MJD)
-			year, week := t.ISOWeek()
-			f.Frames[c][v] = &Frame{
-				Channel:   c,
-				Visit:     v,
-				MJD:       vis.MJD,
-				Lambda:    Channels[c].Lambda(vis.SubBand),
-				Available: r.Float64() > 0.04,
-				File: fmt.Sprintf("level2_%dW%02d_%dB_%04d_1D%d_spx_l2b-v20-%d-%03d.fits",
-					year, week, 1+v%2, 1+(f.seed>>uint(v%40))%9000, c+1, year, t.YearDay()),
-			}
-		}
+	head := func(k int) float64 { return math.Float64frombits(binary.LittleEndian.Uint64(data[8*k:])) }
+	fr.Image, fr.Flags = make([]float32, n), make([]Flag, n)
+	for i := range n {
+		fr.Image[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[40+4*i:]))
+		fr.Flags[i] = Flag(binary.LittleEndian.Uint32(data[40+4*n+4*i:]))
 	}
-
-	mid := nowMJD
-	if len(f.Visits) > 0 {
-		mid = f.Visits[len(f.Visits)/2].MJD
+	fr.MJD, fr.Lambda, fr.Background, fr.Sigma = head(0), head(1), head(2), head(3)
+	fr.Loaded = true
+	// Both detectors of a visit see the source through the same part of their
+	// filters, so either frame tells which sub-band the visit is.
+	if vis := &f.Visits[fr.Visit]; vis.SubBand < 0 {
+		vis.SubBand = head(4)
 	}
-	for _, t := range Targets {
-		s := t.Source
-		sra, sdec := s.Position(mid)
-		if Separation(ra, dec, sra, sdec) < fovArcmin/60 {
-			f.Target = len(f.Sources)
-			f.TargetID = t.ID
-			f.Name = t.Name
-			f.Sources = append(f.Sources, s)
-			break
-		}
-	}
-	f.Sources = append(f.Sources, fieldStars(f.WCS, r)...)
-	return f
+	return nil
 }
 
-// schedule follows the survey geometry: a position is observed when the Sun is
-// about 90 degrees away in ecliptic longitude, twice a year, and near the
-// ecliptic poles it is observed almost continuously.
-func schedule(lon, lat, nowMJD float64, r *rand.Rand) []Visit {
-	s := math.Abs(math.Sin(lat * deg))
-	perSeason := 17 + int(math.Round(7*math.Pow(s, 4)))
-	window := 2 + 10*s*s
-	if math.Abs(lat) > 78 {
-		window = 150
-	}
-	end := nowMJD - processingDays
-
-	var visits []Visit
-	t := float64(surveyStartMJD) - 200
-	season := 0
-	for t < end+window {
-		phase := math.Mod(SunLongitude(t)-lon-90+720, 180)
-		t += (180 - phase) / 0.9856474
-		lo, hi := t-window/2, t+window/2
-		if hi < surveyStartMJD || lo > end {
-			t += 1
-			continue
-		}
-		perm := r.Perm(SubBands)
-		added := 0
-		for j := range perSeason {
-			m := lo + window*(float64(j)+0.2+0.6*r.Float64())/float64(perSeason)
-			if m < surveyStartMJD || m > end {
-				continue
-			}
-			sub := float64(perm[j%SubBands]) + 0.6*r.Float64() - 0.3
-			visits = append(visits, Visit{MJD: m, Season: season, SubBand: math.Max(0, math.Min(SubBands-1, sub))})
-			added++
-		}
-		if added > 0 {
-			season++
-		}
-		t += 1
-	}
-	sort.Slice(visits, func(i, j int) bool { return visits[i].MJD < visits[j].MJD })
-	return visits
+// Source is a catalog entry with its position at epoch MJD.
+type Source struct {
+	Name  string  `json:"name"`
+	RA    float64 `json:"ra"`
+	Dec   float64 `json:"dec"`
+	PMRA  float64 `json:"pmra"` // mas/yr, includes cos(dec)
+	PMDec float64 `json:"pmdec"`
+	MJD   float64 `json:"mjd"`
+	Mag   float64 `json:"mag"` // Gaia G or WISE W2
 }
 
-func fieldStars(w WCS, r *rand.Rand) []Source {
-	b := math.Abs(GalacticLatitude(w.RA, w.Dec))
-	density := 1.2 + 6*math.Exp(-b/12) // stars per arcmin² to K≈17.5
-	count := int(density * starBoxArcmin * starBoxArcmin)
-	half := starBoxArcmin * 60 / w.Scale / 2
-	stars := make([]Source, 0, count)
-	for range count {
-		x := w.CX + (r.Float64()*2-1)*half
-		y := w.CY + (r.Float64()*2-1)*half
-		ra, dec := w.ToSky(x, y)
-		mag := math.Max(6, 17.5+math.Log10(1-r.Float64())/0.32)
-		u := r.Float64()
-		stars = append(stars, Source{
-			RA: ra, Dec: dec,
-			PMRA: r.NormFloat64() * 6, PMDec: r.NormFloat64() * 6,
-			RefMJD: MJDJ2000, Kind: SEDStar, Temp: 2800 + 7000*u*u,
-			Flux: fluxFromMag(mag), RefLambda: 2.2,
-			Catalog: mag < 16,
-		})
-	}
-	return stars
+func (s *Source) Position(mjd float64) (ra, dec float64) {
+	yr := (mjd - s.MJD) / 365.25
+	return s.RA + s.PMRA*yr/3.6e6/math.Cos(s.Dec*deg), s.Dec + s.PMDec*yr/3.6e6
 }
 
-// Load produces the pixels of a frame. With real data this is where the cutout
-// is downloaded and its IMAGE and FLAGS layers decoded.
-func (f *Field) Load(fr *Frame) {
-	if fr.Loaded {
-		return
-	}
-	defer func() { fr.Loaded = true }()
-	if !fr.Available {
-		return
-	}
-	n := f.N
-	r := newRand(f.seed ^ uint64(fr.Channel+1)*0x9e3779b97f4a7c15 ^ uint64(fr.Visit+1)*0xbf58476d1ce4e5b9)
-	ch := Channels[fr.Channel]
-	img := make([]float32, n*n)
-	flags := make([]Flag, n*n)
-
-	lon, _ := Ecliptic(f.WCS.RA, f.WCS.Dec)
-	bg := ch.Zodi * (1 + 0.15*math.Sin(2*math.Pi*fr.MJD/365.25+lon*deg)) * (1 + 0.3*(1-math.Abs(math.Sin(f.EclLat*deg))))
-	gx, gy := r.NormFloat64()*bg*0.001, r.NormFloat64()*bg*0.001
-	for y := range n {
-		for x := range n {
-			img[y*n+x] = float32(bg + gx*(float64(x)-f.WCS.CX) + gy*(float64(y)-f.WCS.CY))
-		}
-	}
-
-	sigma := ch.FWHM / 2.3548
-	for i := range f.Sources {
-		s := &f.Sources[i]
-		ra, dec := s.Position(fr.MJD)
-		x, y := f.WCS.ToPixel(ra, dec)
-		if x < -6 || y < -6 || x > float64(n)+6 || y > float64(n)+6 {
-			continue
-		}
-		if flux := s.FluxAt(fr.Lambda, fr.MJD); flux > 1e-5 {
-			addPSF(img, n, x, y, sigma, flux)
-		}
-	}
-
-	for i, v := range img {
-		if v > Saturation {
-			img[i] = Saturation
-			flags[i] |= FlagNonlinear
-		}
-		img[i] += float32(r.NormFloat64() * ch.Sigma)
-	}
-
-	for range r.IntN(n*n/4000 + 2) {
-		i := r.IntN(n * n)
-		img[i] += float32(0.05 + 0.4*r.Float64())
-		flags[i] |= FlagHot
-	}
-	for range r.IntN(n*n/1500 + 2) {
-		x, y := r.Float64()*float64(n), r.Float64()*float64(n)
-		a := r.Float64() * 2 * math.Pi
-		e := 0.3 + 3*r.Float64()
-		for k := range 1 + r.IntN(4) {
-			px, py := int(x+float64(k)*math.Cos(a)), int(y+float64(k)*math.Sin(a))
-			if px >= 0 && py >= 0 && px < n && py < n {
-				img[py*n+px] += float32(e)
-				flags[py*n+px] |= FlagTransient
-			}
-		}
-	}
-	if r.Float64() < 0.05 {
-		w := 2 + r.IntN(4)
-		x0 := 0
-		if r.IntN(2) == 1 {
-			x0 = n - w
-		}
-		for y := range n {
-			for x := x0; x < x0+w; x++ {
-				img[y*n+x] = 0
-				flags[y*n+x] |= FlagMissing
-			}
-		}
-	}
-
-	fr.Image, fr.Flags = img, flags
-	fr.Background, fr.Sigma = Stats(img, flags)
+type TrackPoint struct {
+	Visit int     `json:"v"`
+	X     float64 `json:"x"`
+	Y     float64 `json:"y"`
 }
 
-// addPSF adds a Gaussian integrated over each pixel, so sub-pixel shifts are
-// rendered faithfully.
-func addPSF(img []float32, n int, x, y, sigma, flux float64) {
-	rad := int(math.Ceil(4*sigma)) + 1
-	x0, y0 := int(math.Floor(x))-rad, int(math.Floor(y))-rad
-	k := 1 / (math.Sqrt2 * sigma)
-	var ex, ey [32]float64
-	size := min(2*rad+1, len(ex))
-	for i := range size {
-		ex[i] = 0.5 * (math.Erf((float64(x0+i+1)-x)*k) - math.Erf((float64(x0+i)-x)*k))
-		ey[i] = 0.5 * (math.Erf((float64(y0+i+1)-y)*k) - math.Erf((float64(y0+i)-y)*k))
-	}
-	for j := range size {
-		py := y0 + j
-		if py < 0 || py >= n {
-			continue
-		}
-		for i := range size {
-			px := x0 + i
-			if px < 0 || px >= n {
-				continue
-			}
-			img[py*n+px] += float32(flux * ex[i] * ey[j])
-		}
-	}
+// Motion is the server's linear fit of a source's position against time, in
+// field pixels and days.
+type Motion struct {
+	X0     float64      `json:"x0"`
+	Y0     float64      `json:"y0"`
+	VX     float64      `json:"vx"`
+	VY     float64      `json:"vy"`
+	T0     float64      `json:"t0"`
+	Moving bool         `json:"moving"`
+	Points []TrackPoint `json:"track"`
+}
+
+func (m *Motion) At(mjd float64) (x, y float64) {
+	return m.X0 + m.VX*(mjd-m.T0), m.Y0 + m.VY*(mjd-m.T0)
 }
 
 // Stats returns the median and a robust sigma (scaled MAD) of unflagged pixels.

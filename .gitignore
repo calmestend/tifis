@@ -1,3 +1,7 @@
 .direnv/
 # Generado por build-web
 web/
+web/
+ejecucion.log
+.venv/
+__pycache__/

@@ -1,5 +1,5 @@
 {
-  description = "Development shell for spherex (raylib-go + wasm)";
+  description = "Development shell for spherex (raylib-go + wasm, Python server)";
 
   inputs = {
     nixpkgs = {
@@ -63,14 +63,17 @@
           fi
         '';
       };
-    # Serves the app and the IRSA proxy from one origin: IRSA sends no CORS
-    # headers, so the browser cannot query it directly.
+    # The server (server/) does the science with astropy, astroquery and photutils.
+    makePython = pkgs:
+      pkgs.python3.withPackages (ps: with ps; [astropy astroquery numpy photutils scipy]);
+    # Serves the app and the API from one origin: IRSA sends no CORS headers,
+    # so the browser cannot query it directly.
     makeServeWeb = pkgs:
       pkgs.writeShellApplication {
         name = "serve-web";
-        runtimeInputs = with pkgs; [go];
+        runtimeInputs = [(makePython pkgs)];
         text = ''
-          exec go run ./cmd/proxy -addr ":''${PORT:-8080}" -web "''${OUT:-web}" "$@"
+          exec python server/main.py --addr ":''${PORT:-8080}" --web "''${OUT:-web}" "$@"
         '';
       };
     makeDevShell = pkgs: let
@@ -95,6 +98,7 @@
           gotools
           golangci-lint
           gomodifytags
+          (makePython pkgs)
           (makeBuildWeb pkgs)
           (makeServeWeb pkgs)
         ];
